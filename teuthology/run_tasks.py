@@ -7,6 +7,7 @@ import types
 
 from copy import deepcopy
 from humanfriendly import format_timespan
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from teuthology.config import config as teuth_config
 from teuthology.exceptions import ConnectionLostError
@@ -15,6 +16,7 @@ from teuthology.misc import get_http_log_path, get_results_url
 from teuthology.sentry import get_client as get_sentry_client
 from teuthology.timer import Timer
 
+root_logger = logging.getLogger()
 log = logging.getLogger(__name__)
 
 
@@ -63,6 +65,75 @@ def _import(from_package, module_name, task_name, fail_on_import_error=False):
     return module
 
 
+def add_file_handler(logger, level, formatter, filename):
+    """
+    Method to add handler
+    Args:
+        logger: logger
+        level : logging level
+        formatter: logging format
+        filename : destination file
+
+    """
+    handler = logging.FileHandler(filename)
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return handler
+
+
+def remove_log_handler(handler):
+    """
+    Remove log handler
+    """
+    if handler:
+        root_logger.removeHandler(handler)
+
+
+def configure_logging(ctx, archive_path):
+    """
+    Configure logging
+    Args:
+        ctx: context object
+        logger: logger
+        archive_path: log file name
+    Returns:
+        handler
+    """
+    # create tasks directory for task logs
+    log_path = os.path.join(archive_path, "tasks")
+    os.makedirs(log_path, exist_ok=True)
+
+    # configure log level and formatter
+    formatter = logging.Formatter(
+        fmt=u'%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S')
+    log_level = logging.DEBUG if ctx.verbose else logging.INFO
+    return log_path, formatter, log_level
+
+
+def generate_unique_name(task_name, task_list):
+    """
+    Generate unique log file name
+    """
+    task_count = len([task_name for task in task_list
+                      if task_name in task.get('name')]) + 1
+    return "{}-{}.log".format(task_name, task_count), task_count
+
+
+def generate_result(all_tasks):
+    """
+    Display and Generate task results
+    """
+    mark = "=" * 25
+    if not all_tasks:
+        log.warning("No tasks found to display results")
+        return
+    log.info("\n{} Tasks Results {}\n".format(mark, mark))
+    for task in all_tasks:
+        log.info(task)
+
+
 def run_one_task(taskname, **kwargs):
     taskname = taskname.replace('-', '_')
     task = get_task(taskname)
@@ -71,7 +142,13 @@ def run_one_task(taskname, **kwargs):
 
 def run_tasks(tasks, ctx):
     archive_path = ctx.config.get('archive_path')
+    log_path = str()
+    log_level = str()
+    log_formatter = str()
+
     if archive_path:
+        log_path, log_formatter, log_level = \
+            configure_logging(ctx, archive_path)
         timer = Timer(
             path=os.path.join(archive_path, 'timing.yaml'),
             sync=True,
@@ -79,19 +156,49 @@ def run_tasks(tasks, ctx):
     else:
         timer = Timer()
     stack = []
+    all_tasks = []
     try:
         for taskdict in tasks:
             try:
                 ((taskname, config),) = taskdict.items()
             except (ValueError, AttributeError):
                 raise RuntimeError('Invalid task definition: %s' % taskdict)
+
+            # Task log creation
+            handler = str()
+            log_file_name, count = generate_unique_name(taskname, all_tasks)
+            task_log_file = os.path.join(log_path, log_file_name)
+            all_tasks.append({"name": taskname + "[%s]" % count if count > 1 else taskname,
+                              "log_file_name": log_file_name,
+                              "log_file": task_log_file})
+
+            if archive_path:
+                # generate unique log file name
+                handler = add_file_handler(root_logger, log_level,
+                                           log_formatter, task_log_file)
             log.info('Running task %s...', taskname)
+
             timer.mark('%s enter' % taskname)
             manager = run_one_task(taskname, ctx=ctx, config=config)
+
             if hasattr(manager, '__enter__'):
-                stack.append((taskname, manager))
+                stack.append((taskname, manager, log_file_name))
                 manager.__enter__()
+            log.info("No exceptions found : Pass")
+            all_tasks[-1].update({'status': 'PASS'})
+            remove_log_handler(handler)
     except BaseException as e:
+        all_tasks[-1].update({'status': 'FAIL'})
+        task = all_tasks[-1]
+        handler = str()
+
+        # Create failed task log file
+        if archive_path:
+            fail_log_file = os.path.join(log_path,
+                                         "failed-" + task.get('log_file_name'))
+            handler = add_file_handler(root_logger, log_level,
+                                       log_formatter, fail_log_file)
+
         if isinstance(e, ConnectionLostError):
             # Prevent connection issues being flagged as failures
             set_status(ctx.summary, 'dead')
@@ -153,6 +260,10 @@ def run_tasks(tasks, ctx):
                 emsg = 'Possible configuration error in yaml file'
                 log.error(emsg)
                 ctx.summary['failure_info'] = emsg
+        log.error(ctx.summary)
+
+        # Remove failed log file handler
+        remove_log_handler(handler)
     finally:
         try:
             exc_info = sys.exc_info()
@@ -164,9 +275,24 @@ def run_tasks(tasks, ctx):
                     .format(sleep_before_teardown))
                 notify_sleep_before_teardown(ctx, stack, sleep_before_teardown)
                 time.sleep(sleep_before_teardown)
+
+            # Remove tasks log file handlers
+            if archive_path:
+                for handler in root_logger.handlers:
+                    if isinstance(handler, logging.FileHandler):
+                        if log_path in handler.baseFilename:
+                            root_logger.removeHandler(handler)
+
             while stack:
-                taskname, manager = stack.pop()
-                log.debug('Unwinding manager %s', taskname)
+                # Append unwinding logs to same task log file(s)
+                taskname, manager, log_file_name = stack.pop()
+                handler = str()
+                if archive_path:
+                    log_file = os.path.join(log_path, log_file_name)
+                    handler = add_file_handler(root_logger, log_level,
+                                               log_formatter, log_file)
+
+                log.debug('\n\nUnwinding manager %s' % taskname)
                 timer.mark('%s exit' % taskname)
                 try:
                     suppress = manager.__exit__(*exc_info)
@@ -194,6 +320,9 @@ def run_tasks(tasks, ctx):
                     if suppress:
                         exc_info = (None, None, None)
 
+                # Remove task log file handler
+                remove_log_handler(handler)
+
             if exc_info != (None, None, None):
                 log.debug('Exception was not quenched, exiting: %s: %s',
                           exc_info[0].__name__, exc_info[1])
@@ -202,6 +331,41 @@ def run_tasks(tasks, ctx):
             # be careful about cyclic references
             del exc_info
         timer.mark("tasks complete")
+        generate_result(all_tasks)
+        build_tasks_results(archive_path, all_tasks)
+
+
+def build_tasks_results(archive_path, all_tasks):
+    """
+    Build task results html file
+    Args:
+        ctx: context object
+        archive_path: archive path
+        all_tasks: task results
+    """
+    if not archive_path:
+        log.warning("task results html file cannot be formed")
+        return
+
+    template_dir = os.path.join(os.path.dirname(__file__),
+                                'templates')
+
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        autoescape=select_autoescape(['html', 'xml'])
+    )
+
+    template = env.get_template('tasks-results.html')
+
+    html = template.render(
+        test_results=all_tasks
+    )
+
+    html_fpath = os.path.join(archive_path, "result.html")
+
+    with open(html_fpath, "wt") as html_file:
+        html_file.write(html)
+
 
 def build_email_body(ctx, stack, sleep_time_sec):
     email_template_path = os.path.dirname(__file__) + \
@@ -214,7 +378,7 @@ def build_email_body(ctx, stack, sleep_time_sec):
     archive_path = ctx.config.get('archive_path')
     job_id = ctx.config.get('job_id')
     status = get_status(ctx.summary)
-    stack_path = '/'.join(task for task, _ in stack)
+    stack_path = '/'.join(task for task, _, _ in stack)
     suite_name=ctx.config.get('suite')
     sleep_date=time.time()
     sleep_date_str=time.strftime('%Y-%m-%d %H:%M:%S',
@@ -239,6 +403,7 @@ def build_email_body(ctx, stack, sleep_time_sec):
     )
     return (subject.strip(), body.strip())
 
+
 def notify_sleep_before_teardown(ctx, stack, sleep_time):
     email = ctx.config.get('email', None)
     if not email:
@@ -256,4 +421,3 @@ def notify_sleep_before_teardown(ctx, stack, sleep_time):
     smtp = smtplib.SMTP('localhost')
     smtp.sendmail(msg['From'], [msg['To']], msg.as_string())
     smtp.quit()
-
