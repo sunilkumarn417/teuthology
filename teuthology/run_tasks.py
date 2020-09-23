@@ -18,6 +18,10 @@ from teuthology.timer import Timer
 
 root_logger = logging.getLogger()
 log = logging.getLogger(__name__)
+formatter = logging.Formatter(
+        fmt=u'%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S')
+all_tasks = []
 
 
 def get_task(name):
@@ -65,19 +69,20 @@ def _import(from_package, module_name, task_name, fail_on_import_error=False):
     return module
 
 
-def add_file_handler(logger, level, formatter, filename):
+def add_file_handler(logger, level, log_formatter, filename):
     """
     Method to add handler
     Args:
         logger: logger
         level : logging level
-        formatter: logging format
+        log_formatter: logging format
         filename : destination file
-
+    Returns:
+        handler
     """
     handler = logging.FileHandler(filename)
     handler.setLevel(level)
-    handler.setFormatter(formatter)
+    handler.setFormatter(log_formatter)
     logger.addHandler(handler)
     return handler
 
@@ -90,13 +95,19 @@ def remove_log_handler(handler):
         root_logger.removeHandler(handler)
 
 
+def get_log_level(ctx):
+    """
+    Get log level
+    """
+    return logging.DEBUG if ctx.verbose else logging.INFO
+
+
 def configure_logging(ctx, archive_path):
     """
     Configure logging
     Args:
         ctx: context object
-        logger: logger
-        archive_path: log file name
+        archive_path: log directory name
     Returns:
         handler
     """
@@ -105,10 +116,7 @@ def configure_logging(ctx, archive_path):
     os.makedirs(log_path, exist_ok=True)
 
     # configure log level and formatter
-    formatter = logging.Formatter(
-        fmt=u'%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S')
-    log_level = logging.DEBUG if ctx.verbose else logging.INFO
+    log_level = get_log_level(ctx)
     return log_path, formatter, log_level
 
 
@@ -129,7 +137,7 @@ def generate_result(all_tasks):
     if not all_tasks:
         log.warning("No tasks found to display results")
         return
-    log.info("\n{} Tasks Results {}\n".format(mark, mark))
+    log.info("{} Tasks Results {}".format(mark, mark))
     for task in all_tasks:
         log.info(task)
 
@@ -137,6 +145,23 @@ def generate_result(all_tasks):
 def run_one_task(taskname, **kwargs):
     taskname = taskname.replace('-', '_')
     task = get_task(taskname)
+
+    # Set logger for the task module
+    logger = kwargs.pop('logger', None)
+    if logger:
+        log_obj_name, log_obj = None, None
+        for i, v in task.__globals__.items():
+            if isinstance(v, logging.Logger) and \
+                    task.__module__ in logger.name:
+                log_obj_name, log_obj = i, v
+                break
+        if log_obj_name and log_obj:
+            task.__globals__[log_obj_name] = logger
+            try:
+                return task(**kwargs)
+            finally:
+                task.__globals__[log_obj_name] = log_obj
+
     return task(**kwargs)
 
 
@@ -156,7 +181,6 @@ def run_tasks(tasks, ctx):
     else:
         timer = Timer()
     stack = []
-    all_tasks = []
     try:
         for taskdict in tasks:
             try:
